@@ -1,3 +1,4 @@
+import 'dotenv/config'
 import http from 'http'
 
 import { setupBigQuery } from '@codebuff/bigquery'

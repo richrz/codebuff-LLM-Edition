@@ -142,6 +142,18 @@ Learn more about the SDK [here](https://www.npmjs.com/package/@codebuff/sdk).
 
 **Fully customizable SDK**: Build Codebuff's capabilities directly into your applications with a complete TypeScript SDK. Create custom tools, integrate with your CI/CD pipeline, build AI-powered development environments, or embed intelligent coding assistance into your products.
 
+## OpenAI-Compatible Endpoints
+
+Codebuff can talk to any OpenAI-compatible proxy such as LiteLLM, OpenRouter, or Ollama with their OpenAI bridge. Configure the target endpoint with these environment variables (see [.env.example](./.env.example)):
+
+```bash
+LLM_BASE_URL=http://127.0.0.1:4000
+LLM_API_KEY=sk-... # token provided by your proxy
+LLM_MODEL=gpt-4o-mini  # or the route/model exposed by the proxy
+```
+
+Point the variables at a new provider and restart the server/CLI to switch models—no code changes required.
+
 ## Contributing to Codebuff
 
 We ❤️ contributions from the community - whether you're fixing bugs, tweaking our agents, or improving documentation.

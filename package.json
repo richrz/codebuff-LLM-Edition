@@ -28,6 +28,8 @@
     "start-jpcsp": "bun --cwd npm-app start-jpcsp",
     "start-vscode": "bun --cwd npm-app start-vscode",
     "start-nushell": "bun --cwd npm-app start-nushell",
+    "build": "tsc -p tsconfig.json",
+    "smoke:llm": "node -e \"import('./backend/tmpdist/llm/openaiCompatible.js').then(async m=>{const r=await m.chat([{role:'user',content:'say hi'}], {timeoutMs:8000});console.log(r)})\"",
     "format": "prettier --write \"**/*.{ts,tsx,json,md}\"",
     "release:npm-app": "bun run --cwd npm-app release",
     "clean-ts": "find . -name '*.tsbuildinfo' -type f -delete && find . -name '.next' -type d -exec rm -rf {} + 2>/dev/null || true && find . -name 'node_modules' -type d -exec rm -rf {} + 2>/dev/null || true && bun install",
@@ -70,5 +72,5 @@
   "engines": {
     "node": ">=20.0.0"
   },
-  "packageManager": "bun@1.0.0"
+  "packageManager": "pnpm@9.12.0"
 }
