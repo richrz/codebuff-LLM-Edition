@@ -1,5 +1,3 @@
-import fetch from 'node-fetch'
-import type { Response } from 'node-fetch'
 
 export type ChatMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool'
