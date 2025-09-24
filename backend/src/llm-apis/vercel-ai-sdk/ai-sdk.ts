@@ -1,88 +1,280 @@
-import { google } from '@ai-sdk/google'
-import { openai } from '@ai-sdk/openai'
-import {
-  finetunedVertexModels,
-  geminiModels,
-  openaiModels,
-} from '@codebuff/common/old-constants'
 import { buildArray } from '@codebuff/common/util/array'
 import { convertCbToModelMessages } from '@codebuff/common/util/messages'
 import { errorToObject } from '@codebuff/common/util/object'
 import { withTimeout } from '@codebuff/common/util/promise'
 import { StopSequenceHandler } from '@codebuff/common/util/stop-sequence'
 import { generateCompactId } from '@codebuff/common/util/string'
-import { APICallError, generateObject, generateText, streamText } from 'ai'
+import { encode } from 'gpt-tokenizer'
 
 import { checkLiveUserInput, getLiveUserInputIds } from '../../live-user-inputs'
 import { logger } from '../../util/logger'
 import { saveMessage } from '../message-cost-tracker'
-import { openRouterLanguageModel } from '../openrouter'
-import { vertexFinetuned } from './vertex-finetuned'
+import { chat } from '../../llm/openaiCompatible'
 
 import type {
-  GeminiModel,
-  Model,
-  OpenAIModel,
-} from '@codebuff/common/old-constants'
+  ChatMessage,
+  ChatStreamChunk,
+} from '../../llm/openaiCompatible'
+import type { Model } from '@codebuff/common/old-constants'
 import type { Message } from '@codebuff/common/types/messages/codebuff-message'
-import type {
-  OpenRouterProviderOptions,
-  OpenRouterUsageAccounting,
-} from '@openrouter/ai-sdk-provider'
-import type { LanguageModel } from 'ai'
 import type { z } from 'zod/v4'
 
 export type StreamChunk =
-  | {
-      type: 'text'
-      text: string
-    }
-  | {
-      type: 'reasoning'
-      text: string
-    }
+  | { type: 'text'; text: string }
+  | { type: 'reasoning'; text: string }
   | { type: 'error'; message: string }
 
-// TODO: We'll want to add all our models here!
-const modelToAiSDKModel = (model: Model): LanguageModel => {
-  if (
-    Object.values(finetunedVertexModels as Record<string, string>).includes(
-      model,
-    )
-  ) {
-    return vertexFinetuned(model)
-  }
-  if (Object.values(geminiModels).includes(model as GeminiModel)) {
-    return google.languageModel(model)
-  }
-  if (model === openaiModels.o3pro || model === openaiModels.o3) {
-    return openai.responses(model)
-  }
-  if (Object.values(openaiModels).includes(model as OpenAIModel)) {
-    return openai.languageModel(model)
-  }
-  // All other models go through OpenRouter
-  return openRouterLanguageModel(model)
+type ProviderOptions = {
+  openrouter?: { reasoning?: { exclude?: boolean } } & Record<string, unknown>
+} & Record<string, unknown>
+
+type SharedOptions = {
+  messages: Message[]
+  clientSessionId: string
+  fingerprintId: string
+  userInputId: string
+  model: Model
+  userId: string | undefined
+  chargeUser?: boolean
+  agentId?: string
+  onCostCalculated?: (credits: number) => Promise<void>
+  includeCacheControl?: boolean
+  temperature?: number
+  topP?: number
+  frequencyPenalty?: number
+  presencePenalty?: number
 }
 
-// TODO: Add retries & fallbacks: likely by allowing this to instead of "model"
-// also take an array of form [{model: Model, retries: number}, {model: Model, retries: number}...]
-// eg: [{model: "gemini-2.0-flash-001"}, {model: "vertex/gemini-2.0-flash-001"}, {model: "claude-3-5-haiku", retries: 3}]
+type PromptAiSdkStreamOptions = SharedOptions & {
+  stopSequences?: string[]
+  maxOutputTokens?: number
+  providerOptions?: ProviderOptions
+  thinkingBudget?: number
+  maxRetries?: number
+  signal?: AbortSignal
+}
+
+type PromptAiSdkOptions = SharedOptions & {
+  maxTokens?: number
+  stopSequences?: string[]
+}
+
+type PromptAiSdkStructuredOptions<T> = SharedOptions & {
+  schema: z.ZodType<T>
+  maxTokens?: number
+  timeout?: number
+  stopSequences?: string[]
+}
+
+type ConvertedMessage = ReturnType<typeof convertCbToModelMessages>[number]
+type ConvertedContent = ConvertedMessage['content']
+
+type ConvertedContentPart = ConvertedContent extends string
+  ? never
+  : ConvertedContent extends Array<infer Part>
+    ? Part
+    : never
+
+function toBase64(data: unknown): string | null {
+  if (typeof data === 'string') {
+    return data
+  }
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(data)) {
+    return (data as Buffer).toString('base64')
+  }
+  if (data instanceof Uint8Array) {
+    return Buffer.from(data).toString('base64')
+  }
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(new Uint8Array(data)).toString('base64')
+  }
+  return null
+}
+
+function stringifyContentPart(part: ConvertedContentPart): string {
+  if (!part) {
+    return ''
+  }
+
+  if (typeof part === 'string') {
+    return part
+  }
+
+  const anyPart = part as Record<string, unknown>
+
+  if (typeof anyPart.text === 'string') {
+    return anyPart.text
+  }
+
+  const type = typeof anyPart.type === 'string' ? (anyPart.type as string) : undefined
+  if (type === 'file') {
+    const base64 = toBase64(anyPart.data)
+    if (base64) {
+      return base64
+    }
+    if (typeof anyPart.mediaType === 'string') {
+      return `[file:${anyPart.mediaType}]`
+    }
+    return '[file]'
+  }
+  if (type === 'image') {
+    if (typeof anyPart.image === 'string') {
+      return anyPart.image
+    }
+    if (anyPart.image instanceof URL) {
+      return anyPart.image.toString()
+    }
+    const base64 = toBase64(anyPart.image)
+    if (base64) {
+      return base64
+    }
+    if (typeof anyPart.mediaType === 'string') {
+      return `[image:${anyPart.mediaType}]`
+    }
+    return '[image]'
+  }
+  if (type === 'tool-call') {
+    const { toolCallId, toolName, input } = anyPart
+    return JSON.stringify({ toolCallId, toolName, input })
+  }
+  if (typeof anyPart.reasoning === 'string') {
+    return anyPart.reasoning
+  }
+
+  return ''
+}
+
+function stringifyContent(content: ConvertedContent): string {
+  if (typeof content === 'string') {
+    return content
+  }
+  return content
+    .map((part) => stringifyContentPart(part as ConvertedContentPart))
+    .filter((text) => text.length > 0)
+    .join('\n')
+}
+
+function convertMessagesToChatMessages(
+  messages: Message[],
+  includeCacheControl?: boolean,
+): ChatMessage[] {
+  const converted = convertCbToModelMessages({
+    messages,
+    includeCacheControl: includeCacheControl ?? true,
+  })
+
+  return converted.map((message) => {
+    const chatMessage: ChatMessage = {
+      role: message.role as ChatMessage['role'],
+      content: stringifyContent(message.content),
+    }
+
+    if ('name' in message && typeof (message as any).name === 'string') {
+      chatMessage.name = (message as any).name
+    }
+
+    return chatMessage
+  })
+}
+
+function estimateTokensForMessages(messages: ChatMessage[]): number {
+  if (!messages.length) {
+    return 0
+  }
+  const serialized = messages
+    .map((message) => `${message.role}: ${message.content}`)
+    .join('\n')
+  return encode(serialized).length
+}
+
+function estimateTokensForText(text: string): number {
+  if (!text) {
+    return 0
+  }
+  return encode(text).length
+}
+
+function extractJsonSubstring(text: string): string | null {
+  const trimmed = text.trim()
+  const starts = [trimmed.indexOf('{'), trimmed.indexOf('[')].filter(
+    (index) => index !== -1,
+  )
+  if (starts.length === 0) {
+    return null
+  }
+
+  const start = Math.min(...starts)
+  const openingChar = trimmed[start]
+  const closingChar = openingChar === '{' ? '}' : ']'
+
+  const stack: string[] = []
+  let inString = false
+  let escape = false
+
+  for (let i = start; i < trimmed.length; i += 1) {
+    const char = trimmed[i]
+
+    if (inString) {
+      if (escape) {
+        escape = false
+        continue
+      }
+      if (char === '\\') {
+        escape = true
+        continue
+      }
+      if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      continue
+    }
+
+    if (char === '{' || char === '[') {
+      stack.push(char === '{' ? '}' : ']')
+      continue
+    }
+
+    if (char === '}' || char === ']') {
+      const expected = stack.pop()
+      if (char !== expected) {
+        return null
+      }
+      if (stack.length === 0) {
+        return trimmed.slice(start, i + 1)
+      }
+    }
+  }
+
+  return null
+}
+
+function parseStructuredOutput<T>(raw: string, schema: z.ZodType<T>): T {
+  const candidates = new Set<string>()
+  candidates.add(raw.trim())
+  const extracted = extractJsonSubstring(raw)
+  if (extracted) {
+    candidates.add(extracted)
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate)
+      return schema.parse(parsed)
+    } catch {
+      continue
+    }
+  }
+
+  throw new Error('Structured response was not valid JSON')
+}
+
 export const promptAiSdkStream = async function* (
-  options: {
-    messages: Message[]
-    clientSessionId: string
-    fingerprintId: string
-    model: Model
-    userId: string | undefined
-    chargeUser?: boolean
-    thinkingBudget?: number
-    userInputId: string
-    agentId?: string
-    maxRetries?: number
-    onCostCalculated?: (credits: number) => Promise<void>
-    includeCacheControl?: boolean
-  } & Omit<Parameters<typeof streamText>[0], 'model' | 'messages'>,
+  options: PromptAiSdkStreamOptions,
 ): AsyncGenerator<StreamChunk, string | null> {
   if (
     !checkLiveUserInput(
@@ -101,133 +293,95 @@ export const promptAiSdkStream = async function* (
     )
     return null
   }
+
   const startTime = Date.now()
-
-  let aiSDKModel = modelToAiSDKModel(options.model)
-
-  const response = streamText({
-    ...options,
-    model: aiSDKModel,
-    maxRetries: options.maxRetries,
-    messages: convertCbToModelMessages(options),
-  })
-
-  let content = ''
+  const chatMessages = convertMessagesToChatMessages(
+    options.messages,
+    options.includeCacheControl,
+  )
+  const inputTokens = estimateTokensForMessages(chatMessages)
   const stopSequenceHandler = new StopSequenceHandler(options.stopSequences)
 
-  for await (const chunk of response.fullStream) {
-    if (chunk.type !== 'text-delta') {
-      const flushed = stopSequenceHandler.flush()
-      if (flushed) {
-        yield {
-          type: 'text',
-          text: flushed,
+  let content = ''
+  let stream: AsyncGenerator<ChatStreamChunk, void, unknown> | undefined
+  let streamClosed = false
+
+  try {
+    stream = await chat(chatMessages, {
+      stream: true,
+      temperature: options.temperature,
+      maxTokens: options.maxOutputTokens,
+      stop: options.stopSequences,
+      topP: options.topP,
+      frequencyPenalty: options.frequencyPenalty,
+      presencePenalty: options.presencePenalty,
+      signal: options.signal,
+    })
+
+    const openrouterOptions = options.providerOptions?.openrouter
+    const skipReasoning = Boolean(openrouterOptions?.reasoning?.exclude)
+
+    for await (const chunk of stream) {
+      if (chunk.type === 'reasoning') {
+        if (!skipReasoning && chunk.text) {
+          yield { type: 'reasoning', text: chunk.text }
         }
-      }
-    }
-    if (chunk.type === 'error') {
-      logger.error(
-        {
-          chunk: { ...chunk, error: undefined },
-          error: errorToObject(chunk.error),
-          model: options.model,
-        },
-        'Error from AI SDK',
-      )
-
-      const errorBody = APICallError.isInstance(chunk.error)
-        ? chunk.error.responseBody
-        : undefined
-      const mainErrorMessage =
-        chunk.error instanceof Error
-          ? chunk.error.message
-          : typeof chunk.error === 'string'
-            ? chunk.error
-            : JSON.stringify(chunk.error)
-      const errorMessage = `Error from AI SDK (model ${options.model}): ${buildArray([mainErrorMessage, errorBody]).join('\n')}`
-      yield {
-        type: 'error',
-        message: errorMessage,
-      }
-
-      return null
-    }
-    if (chunk.type === 'reasoning-delta') {
-      if (
-        (
-          options.providerOptions?.openrouter as
-            | OpenRouterProviderOptions
-            | undefined
-        )?.reasoning?.exclude
-      ) {
         continue
       }
-      yield {
-        type: 'reasoning',
-        text: chunk.text,
+
+      if (!chunk.text) {
+        continue
       }
-    }
-    if (chunk.type === 'text-delta') {
-      if (!options.stopSequences) {
+
+      if (!options.stopSequences?.length) {
         content += chunk.text
-        if (chunk.text) {
-          yield {
-            type: 'text',
-            text: chunk.text,
-          }
-        }
+        yield { type: 'text', text: chunk.text }
         continue
       }
 
-      const stopSequenceResult = stopSequenceHandler.process(chunk.text)
-      if (stopSequenceResult.text) {
-        yield {
-          type: 'text',
-          text: stopSequenceResult.text,
-        }
+      const result = stopSequenceHandler.process(chunk.text)
+      if (result.text) {
+        content += result.text
+        yield { type: 'text', text: result.text }
       }
+      if (result.endOfStream) {
+        streamClosed = true
+        if (typeof stream.return === 'function') {
+          await stream.return(undefined).catch(() => {})
+        }
+        break
+      }
+    }
+
+    streamClosed = true
+  } catch (error) {
+    logger.error(
+      {
+        error: errorToObject(error),
+        model: options.model,
+      },
+      'Error from OpenAI-compatible adapter',
+    )
+    const errorMessage = `Error from LLM adapter (model ${options.model}): ${buildArray([
+      error instanceof Error ? error.message : String(error),
+    ]).join('\n')}`
+    yield { type: 'error', message: errorMessage }
+    return null
+  } finally {
+    if (!streamClosed && stream && typeof stream.return === 'function') {
+      await stream.return(undefined).catch(() => {})
     }
   }
+
   const flushed = stopSequenceHandler.flush()
   if (flushed) {
-    yield {
-      type: 'text',
-      text: flushed,
-    }
+    content += flushed
+    yield { type: 'text', text: flushed }
   }
 
-  const providerMetadata = (await response.providerMetadata) ?? {}
-  const usage = await response.usage
-  let inputTokens = usage.inputTokens || 0
-  const outputTokens = usage.outputTokens || 0
-  let cacheReadInputTokens: number = 0
-  let cacheCreationInputTokens: number = 0
-  let costOverrideDollars: number | undefined
-  if (providerMetadata.anthropic) {
-    cacheReadInputTokens =
-      typeof providerMetadata.anthropic.cacheReadInputTokens === 'number'
-        ? providerMetadata.anthropic.cacheReadInputTokens
-        : 0
-    cacheCreationInputTokens =
-      typeof providerMetadata.anthropic.cacheCreationInputTokens === 'number'
-        ? providerMetadata.anthropic.cacheCreationInputTokens
-        : 0
-  }
-  if (providerMetadata.openrouter) {
-    if (providerMetadata.openrouter.usage) {
-      const openrouterUsage = providerMetadata.openrouter
-        .usage as OpenRouterUsageAccounting
-      cacheReadInputTokens =
-        openrouterUsage.promptTokensDetails?.cachedTokens ?? 0
-      inputTokens = openrouterUsage.promptTokens - cacheReadInputTokens
+  const outputTokens = estimateTokensForText(content)
+  const messageId = generateCompactId()
 
-      costOverrideDollars =
-        (openrouterUsage.cost ?? 0) +
-        (openrouterUsage.costDetails?.upstreamInferenceCost ?? 0)
-    }
-  }
-
-  const messageId = (await response.response).id
   const creditsUsedPromise = saveMessage({
     messageId,
     userId: options.userId,
@@ -239,16 +393,14 @@ export const promptAiSdkStream = async function* (
     response: content,
     inputTokens,
     outputTokens,
-    cacheCreationInputTokens,
-    cacheReadInputTokens,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
     finishedAt: new Date(),
     latencyMs: Date.now() - startTime,
     chargeUser: options.chargeUser ?? true,
-    costOverrideDollars,
     agentId: options.agentId,
   })
 
-  // Call the cost callback if provided
   if (options.onCostCalculated) {
     const creditsUsed = await creditsUsedPromise
     await options.onCostCalculated(creditsUsed)
@@ -257,20 +409,8 @@ export const promptAiSdkStream = async function* (
   return messageId
 }
 
-// TODO: figure out a nice way to unify stream & non-stream versions maybe?
 export const promptAiSdk = async function (
-  options: {
-    messages: Message[]
-    clientSessionId: string
-    fingerprintId: string
-    userInputId: string
-    model: Model
-    userId: string | undefined
-    chargeUser?: boolean
-    agentId?: string
-    onCostCalculated?: (credits: number) => Promise<void>
-    includeCacheControl?: boolean
-  } & Omit<Parameters<typeof generateText>[0], 'model' | 'messages'>,
+  options: PromptAiSdkOptions,
 ): Promise<string> {
   if (
     !checkLiveUserInput(
@@ -291,16 +431,34 @@ export const promptAiSdk = async function (
   }
 
   const startTime = Date.now()
-  let aiSDKModel = modelToAiSDKModel(options.model)
+  const chatMessages = convertMessagesToChatMessages(
+    options.messages,
+    options.includeCacheControl,
+  )
+  const inputTokens = estimateTokensForMessages(chatMessages)
 
-  const response = await generateText({
-    ...options,
-    model: aiSDKModel,
-    messages: convertCbToModelMessages(options),
-  })
-  const content = response.text
-  const inputTokens = response.usage.inputTokens || 0
-  const outputTokens = response.usage.inputTokens || 0
+  let content: string
+  try {
+    content = await chat(chatMessages, {
+      temperature: options.temperature,
+      maxTokens: options.maxTokens,
+      stop: options.stopSequences,
+      topP: options.topP,
+      frequencyPenalty: options.frequencyPenalty,
+      presencePenalty: options.presencePenalty,
+    })
+  } catch (error) {
+    logger.error(
+      {
+        error: errorToObject(error),
+        model: options.model,
+      },
+      'Error from OpenAI-compatible adapter',
+    )
+    throw error
+  }
+
+  const outputTokens = estimateTokensForText(content)
 
   const creditsUsedPromise = saveMessage({
     messageId: generateCompactId(),
@@ -313,13 +471,14 @@ export const promptAiSdk = async function (
     response: content,
     inputTokens,
     outputTokens,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
     finishedAt: new Date(),
     latencyMs: Date.now() - startTime,
     chargeUser: options.chargeUser ?? true,
     agentId: options.agentId,
   })
 
-  // Call the cost callback if provided
   if (options.onCostCalculated) {
     const creditsUsed = await creditsUsedPromise
     await options.onCostCalculated(creditsUsed)
@@ -328,23 +487,9 @@ export const promptAiSdk = async function (
   return content
 }
 
-// Copied over exactly from promptAiSdk but with a schema
-export const promptAiSdkStructured = async function <T>(options: {
-  messages: Message[]
-  schema: z.ZodType<T>
-  clientSessionId: string
-  fingerprintId: string
-  userInputId: string
-  model: Model
-  userId: string | undefined
-  maxTokens?: number
-  temperature?: number
-  timeout?: number
-  chargeUser?: boolean
-  agentId?: string
-  onCostCalculated?: (credits: number) => Promise<void>
-  includeCacheControl?: boolean
-}): Promise<T> {
+export const promptAiSdkStructured = async function <T>(
+  options: PromptAiSdkStructuredOptions<T>,
+): Promise<T> {
   if (
     !checkLiveUserInput(
       options.userId,
@@ -362,22 +507,42 @@ export const promptAiSdkStructured = async function <T>(options: {
     )
     return {} as T
   }
-  const startTime = Date.now()
-  let aiSDKModel = modelToAiSDKModel(options.model)
 
-  const responsePromise = generateObject<z.ZodType<T>, 'object'>({
-    ...options,
-    model: aiSDKModel,
-    output: 'object',
-    messages: convertCbToModelMessages(options),
+  const startTime = Date.now()
+  const chatMessages = convertMessagesToChatMessages(
+    options.messages,
+    options.includeCacheControl,
+  )
+  const inputTokens = estimateTokensForMessages(chatMessages)
+
+  const chatPromise = chat(chatMessages, {
+    temperature: options.temperature,
+    maxTokens: options.maxTokens,
+    stop: options.stopSequences,
+    topP: options.topP,
+    frequencyPenalty: options.frequencyPenalty,
+    presencePenalty: options.presencePenalty,
   })
 
-  const response = await (options.timeout === undefined
-    ? responsePromise
-    : withTimeout(responsePromise, options.timeout))
-  const content = response.object
-  const inputTokens = response.usage.inputTokens || 0
-  const outputTokens = response.usage.inputTokens || 0
+  let rawResponse: string
+  try {
+    rawResponse = await (options.timeout === undefined
+      ? chatPromise
+      : withTimeout(chatPromise, options.timeout))
+  } catch (error) {
+    logger.error(
+      {
+        error: errorToObject(error),
+        model: options.model,
+      },
+      'Error from OpenAI-compatible adapter',
+    )
+    throw error
+  }
+
+  const parsed = parseStructuredOutput(rawResponse, options.schema)
+  const serialized = JSON.stringify(parsed)
+  const outputTokens = estimateTokensForText(serialized)
 
   const creditsUsedPromise = saveMessage({
     messageId: generateCompactId(),
@@ -387,20 +552,21 @@ export const promptAiSdkStructured = async function <T>(options: {
     userInputId: options.userInputId,
     model: options.model,
     request: options.messages,
-    response: JSON.stringify(content),
+    response: serialized,
     inputTokens,
     outputTokens,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
     finishedAt: new Date(),
     latencyMs: Date.now() - startTime,
     chargeUser: options.chargeUser ?? true,
     agentId: options.agentId,
   })
 
-  // Call the cost callback if provided
   if (options.onCostCalculated) {
     const creditsUsed = await creditsUsedPromise
     await options.onCostCalculated(creditsUsed)
   }
 
-  return content
+  return parsed
 }
